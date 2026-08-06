@@ -86,6 +86,11 @@ enforced host-side at injection:
 wirken credential add records-api --host records.example.org
 ```
 
+`wirken credential add --host` canonicalizes each binding through
+`url::Url::host_str()` before storage, so ASCII hostnames are lowercased
+and Unicode names are stored in their ASCII/punycode form. The request
+path uses the same parsed-host representation.
+
 `http_request` resolves the credential through the `CredentialResolver`,
 which checks the request's host against the credential's stored
 `allowed_hosts` (exact, case-insensitive) before returning the secret.
@@ -296,12 +301,6 @@ Stated in the same plain terms as the egress boundary comment
 - Credential-host matching is exact per host; there is no `*.` wildcard
   for credential bindings (the egress allowlist has one, but a credential
   binding does not, by choice).
-- Credential-host bindings are stored and matched as ASCII/punycode. A
-  `--host` given in unicode (`café.example`) is stored unnormalized and
-  never matches the request host's punycode form (`xn--caf-dma.example`),
-  so it is silently unusable. This fails closed (no security impact) but
-  is a footgun; normalizing `--host` to lowercase punycode at store time
-  is a pending fix (adds a `url` dependency to the CLI).
 - Production CLI wiring is in place: the gateway opens the vault at
   startup and attaches a `VaultCredentialResolver` to the agent factory,
   so every waked agent resolves host-bound credentials. If the vault is

@@ -307,6 +307,7 @@ pub async fn add(
     if value.is_empty() {
         anyhow::bail!("empty value");
     }
+    let allowed_hosts = normalize_allowed_hosts(allowed_hosts)?;
 
     let keychain = probe_keychain(&cfg.data_dir, || {
         Password::new()
@@ -326,7 +327,7 @@ pub async fn add(
             &secret,
             None,
             None,
-            allowed_hosts,
+            &allowed_hosts,
         )
         .context(format!("Failed to store '{name}'"))?;
 
@@ -339,6 +340,25 @@ pub async fn add(
         );
     }
     Ok(())
+}
+
+/// Canonicalize operator-supplied host bindings to the same ASCII,
+/// lowercase representation returned by `Url::host_str()` when
+/// `http_request` later parses a request URL. This keeps the stored
+/// binding and the enforcement-time host in the same representation,
+/// including IDNA/punycode conversion for Unicode domain names.
+fn normalize_allowed_hosts(hosts: &[String]) -> Result<Vec<String>> {
+    hosts
+        .iter()
+        .map(|host| {
+            let url = url::Url::parse(&format!("https://{host}/"))
+                .with_context(|| format!("invalid credential host '{host}'"))?;
+            let normalized = url
+                .host_str()
+                .ok_or_else(|| anyhow!("invalid credential host '{host}': no host"))?;
+            Ok(normalized.to_string())
+        })
+        .collect()
 }
 
 /// Obtain the raw credential value from the requested source. Public
@@ -450,6 +470,27 @@ mod tests {
             ValueSource::File(path) => assert_eq!(path, p),
             _ => panic!("expected File"),
         }
+    }
+
+    #[test]
+    fn normalize_allowed_hosts_lowercases_ascii() {
+        let hosts = vec!["EXAMPLE.COM".to_string()];
+        assert_eq!(normalize_allowed_hosts(&hosts).unwrap(), vec!["example.com"]);
+    }
+
+    #[test]
+    fn normalize_allowed_hosts_converts_unicode_to_punycode() {
+        let hosts = vec!["café.example".to_string()];
+        assert_eq!(
+            normalize_allowed_hosts(&hosts).unwrap(),
+            vec!["xn--caf-dma.example"]
+        );
+    }
+
+    #[test]
+    fn normalize_allowed_hosts_rejects_missing_host() {
+        let hosts = vec![String::new()];
+        assert!(normalize_allowed_hosts(&hosts).is_err());
     }
 
     #[test]
