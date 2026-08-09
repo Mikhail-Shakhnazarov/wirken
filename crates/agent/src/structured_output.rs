@@ -23,17 +23,20 @@ use crate::error::AgentError;
 use crate::llm::{LlmClient, LlmResponse, Usage};
 use crate::tool::ToolDef;
 
-/// Provider/runtime evidence for the exact bounded call that produced
-/// a structured result.
+/// Evidence for one bounded [`LlmClient::complete`] invocation that
+/// produced a structured result.
 ///
 /// This is deliberately separate from any domain-level basis identity.
-/// A caller can bind its own `basis_id`, requirement id, or procedure id
-/// to this receipt without making the provider attempt the identity of
-/// the intellectual object.
+/// It is also deliberately **not** called a physical-attempt receipt:
+/// `LlmClient` may internally retry HTTP 429 responses, so one bounded
+/// completion can contain several transport attempts. This receipt binds
+/// the caller-visible structured call and its admitted result. Consumers
+/// that need per-transport-attempt identity require the stronger recovery/
+/// session audit path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StructuredAttemptReceipt {
-    /// Locally minted identity for this physical model attempt.
-    pub attempt_id: String,
+pub struct StructuredCallReceipt {
+    /// Locally minted identity for this bounded structured call.
+    pub call_id: String,
     /// Provider and model from the exact [`crate::llm::LlmConfig`] used.
     pub provider: String,
     pub model: String,
@@ -56,8 +59,8 @@ pub struct StructuredAttemptReceipt {
 }
 
 #[derive(Debug, Clone)]
-struct StructuredAttemptStart {
-    attempt_id: String,
+struct StructuredCallStart {
+    call_id: String,
     provider: String,
     model: String,
     config_sha256: String,
@@ -66,7 +69,7 @@ struct StructuredAttemptStart {
 }
 
 /// Typed structured result plus the exact raw result bytes, provider-reported
-/// usage, and physical-attempt evidence.
+/// usage, and bounded-call evidence.
 ///
 /// Retaining `raw_arguments` matters when later audit/replay needs the model's
 /// exact returned JSON rather than a reserialization of `value`, which may be
@@ -76,7 +79,7 @@ pub struct StructuredOutput<T> {
     pub value: T,
     pub raw_arguments: String,
     pub usage: Option<Usage>,
-    pub receipt: StructuredAttemptReceipt,
+    pub receipt: StructuredCallReceipt,
 }
 
 /// Failure modes for one structured-output model call.
@@ -124,13 +127,13 @@ fn sha256_json<T: Serialize>(value: &T) -> Result<String, StructuredOutputError>
     Ok(sha256_bytes(&bytes))
 }
 
-fn attempt_start(
+fn call_start(
     llm: &LlmClient,
     messages: &[Message],
     output_tool: &ToolDef,
-) -> Result<StructuredAttemptStart, StructuredOutputError> {
-    Ok(StructuredAttemptStart {
-        attempt_id: format!("structured-{}", uuid::Uuid::new_v4()),
+) -> Result<StructuredCallStart, StructuredOutputError> {
+    Ok(StructuredCallStart {
+        call_id: format!("structured-{}", uuid::Uuid::new_v4()),
         provider: llm.config().provider.clone(),
         model: llm.config().model.clone(),
         config_sha256: sha256_json(llm.config())?,
@@ -148,7 +151,7 @@ fn admit_structured_response<T: DeserializeOwned>(
     response: LlmResponse,
     expected_tool: &str,
     usage: Option<Usage>,
-    start: StructuredAttemptStart,
+    start: StructuredCallStart,
 ) -> Result<StructuredOutput<T>, StructuredOutputError> {
     match response {
         LlmResponse::ToolCalls(calls) => {
@@ -168,8 +171,8 @@ fn admit_structured_response<T: DeserializeOwned>(
                     raw: raw_arguments.clone(),
                 }
             })?;
-            let receipt = StructuredAttemptReceipt {
-                attempt_id: start.attempt_id,
+            let receipt = StructuredCallReceipt {
+                call_id: start.call_id,
                 provider: start.provider,
                 model: start.model,
                 config_sha256: start.config_sha256,
@@ -206,7 +209,7 @@ pub async fn complete_structured<T: DeserializeOwned>(
     output_tool: ToolDef,
 ) -> Result<StructuredOutput<T>, StructuredOutputError> {
     let tool_name = output_tool.name.clone();
-    let start = attempt_start(llm, messages, &output_tool)?;
+    let start = call_start(llm, messages, &output_tool)?;
     let (response, usage) = llm
         .complete(messages, &[output_tool], api_key)
         .await
@@ -267,9 +270,9 @@ mod tests {
         }
     }
 
-    fn start() -> StructuredAttemptStart {
-        StructuredAttemptStart {
-            attempt_id: "structured-test".to_string(),
+    fn start() -> StructuredCallStart {
+        StructuredCallStart {
+            call_id: "structured-test".to_string(),
             provider: "test-provider".to_string(),
             model: "test-model".to_string(),
             config_sha256: "sha256:config".to_string(),
@@ -279,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn admits_expected_tool_call_and_binds_attempt_evidence() {
+    fn admits_expected_tool_call_and_binds_call_evidence() {
         let raw = r#"{"answer":"yes","count":2}"#;
         let output = admit_structured_response::<FixtureResult>(
             LlmResponse::ToolCalls(vec![tool_call("emit_fixture", raw)]),
@@ -298,7 +301,7 @@ mod tests {
         );
         assert_eq!(output.raw_arguments, raw);
         assert!(output.usage.is_none());
-        assert_eq!(output.receipt.attempt_id, "structured-test");
+        assert_eq!(output.receipt.call_id, "structured-test");
         assert_eq!(output.receipt.provider, "test-provider");
         assert_eq!(output.receipt.model, "test-model");
         assert_eq!(output.receipt.response_tool_call_id, "call-1");
@@ -309,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn attempt_evidence_changes_when_messages_change() {
+    fn call_evidence_changes_when_messages_change() {
         let llm = LlmClient::new(crate::llm::LlmConfig::ollama("fixture-model")).unwrap();
         let tool = ToolDef {
             name: "emit_fixture".to_string(),
@@ -330,8 +333,8 @@ mod tests {
             tool_name: None,
             tool_calls: None,
         }];
-        let a = attempt_start(&llm, &messages_a, &tool).unwrap();
-        let b = attempt_start(&llm, &messages_b, &tool).unwrap();
+        let a = call_start(&llm, &messages_a, &tool).unwrap();
+        let b = call_start(&llm, &messages_b, &tool).unwrap();
         assert_ne!(a.messages_sha256, b.messages_sha256);
         assert_eq!(a.output_schema_sha256, b.output_schema_sha256);
     }
