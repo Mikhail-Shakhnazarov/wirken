@@ -14,7 +14,7 @@
 //! This module does **not** execute the supplied tool. The tool is an
 //! output schema carrier only.
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -65,16 +65,16 @@ struct StructuredAttemptStart {
     output_schema_sha256: String,
 }
 
-/// Typed structured result plus provider-reported usage and exact call
-/// evidence.
+/// Typed structured result plus the exact raw result bytes, provider-reported
+/// usage, and physical-attempt evidence.
 ///
-/// Usage stays attached to the call boundary even when a caller does
-/// not need it. This avoids forcing evidence- or cost-sensitive
-/// consumers to drop metadata merely because the first Zirkel callers
-/// only needed the value.
+/// Retaining `raw_arguments` matters when later audit/replay needs the model's
+/// exact returned JSON rather than a reserialization of `value`, which may be
+/// semantically equivalent but byte-different.
 #[derive(Debug)]
 pub struct StructuredOutput<T> {
     pub value: T,
+    pub raw_arguments: String,
     pub usage: Option<Usage>,
     pub receipt: StructuredAttemptReceipt,
 }
@@ -119,7 +119,8 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 }
 
 fn sha256_json<T: Serialize>(value: &T) -> Result<String, StructuredOutputError> {
-    let bytes = serde_json::to_vec(value).map_err(|e| StructuredOutputError::Evidence(e.to_string()))?;
+    let bytes = serde_json::to_vec(value)
+        .map_err(|e| StructuredOutputError::Evidence(e.to_string()))?;
     Ok(sha256_bytes(&bytes))
 }
 
@@ -159,11 +160,12 @@ fn admit_structured_response<T: DeserializeOwned>(
                     expected: expected_tool.to_string(),
                     actual,
                 })?;
-            let value = serde_json::from_str::<T>(&call.arguments).map_err(|e| {
+            let raw_arguments = call.arguments.clone();
+            let value = serde_json::from_str::<T>(&raw_arguments).map_err(|e| {
                 StructuredOutputError::ParseArguments {
                     tool: expected_tool.to_string(),
                     error: e.to_string(),
-                    raw: call.arguments.clone(),
+                    raw: raw_arguments.clone(),
                 }
             })?;
             let receipt = StructuredAttemptReceipt {
@@ -174,10 +176,11 @@ fn admit_structured_response<T: DeserializeOwned>(
                 messages_sha256: start.messages_sha256,
                 output_schema_sha256: start.output_schema_sha256,
                 response_tool_call_id: call.id.clone(),
-                response_arguments_sha256: sha256_bytes(call.arguments.as_bytes()),
+                response_arguments_sha256: sha256_bytes(raw_arguments.as_bytes()),
             };
             Ok(StructuredOutput {
                 value,
+                raw_arguments,
                 usage,
                 receipt,
             })
@@ -277,11 +280,9 @@ mod tests {
 
     #[test]
     fn admits_expected_tool_call_and_binds_attempt_evidence() {
+        let raw = r#"{"answer":"yes","count":2}"#;
         let output = admit_structured_response::<FixtureResult>(
-            LlmResponse::ToolCalls(vec![tool_call(
-                "emit_fixture",
-                r#"{"answer":"yes","count":2}"#,
-            )]),
+            LlmResponse::ToolCalls(vec![tool_call("emit_fixture", raw)]),
             "emit_fixture",
             None,
             start(),
@@ -295,6 +296,7 @@ mod tests {
                 count: 2,
             }
         );
+        assert_eq!(output.raw_arguments, raw);
         assert!(output.usage.is_none());
         assert_eq!(output.receipt.attempt_id, "structured-test");
         assert_eq!(output.receipt.provider, "test-provider");
@@ -302,7 +304,7 @@ mod tests {
         assert_eq!(output.receipt.response_tool_call_id, "call-1");
         assert_eq!(
             output.receipt.response_arguments_sha256,
-            sha256_bytes(r#"{"answer":"yes","count":2}"#.as_bytes())
+            sha256_bytes(raw.as_bytes())
         );
     }
 
