@@ -1,19 +1,21 @@
 //! Theme naming for Zirkel clusters.
 //!
-//! One LLM call per cluster using the
-//! [`crate::synthetic_tool::name_theme_tool`] structured-output
-//! channel. Input: the cluster's member titles plus the union of
-//! `matched_keywords` across members. Output: a 2–5 word theme
-//! name like "FTC enforcement" or "biometric privacy in employment".
+//! One LLM call per cluster using the reusable
+//! [`wirken_agent::structured_output`] boundary with Zirkel's
+//! [`crate::synthetic_tool::name_theme_tool`] result schema. Input:
+//! the cluster's member titles plus the union of `matched_keywords`
+//! across members. Output: a 2–5 word theme name like "FTC
+//! enforcement" or "biometric privacy in employment".
 //!
 //! Per `docs/zirkel/DESIGN.md`: names should read like prose, not
-//! cluster ids or jargon. The synthetic tool's parameter description
-//! and the system prompt both reinforce that constraint.
+//! cluster ids or jargon. The schema description and system prompt
+//! both reinforce that constraint.
 
 use thiserror::Error;
 use wirken_agent::llm::LlmClient;
+use wirken_agent::structured_output::{StructuredOutputError, complete_structured_prompt};
 
-use crate::synthetic_tool::{NameThemeArgs, SyntheticToolError, call_structured, name_theme_tool};
+use crate::synthetic_tool::{NameThemeArgs, name_theme_tool};
 
 /// One cluster member, as the orchestrator hands it to
 /// [`name_theme`]. `matched_keywords` is the JSON array stored on
@@ -26,8 +28,8 @@ pub struct ClusterMember {
 
 #[derive(Debug, Error)]
 pub enum ThemeNameError {
-    #[error("synthetic-tool call failed: {0}")]
-    Synthetic(#[from] SyntheticToolError),
+    #[error("structured-output call failed: {0}")]
+    Structured(#[from] StructuredOutputError),
     #[error("cluster has no members; cannot name an empty cluster")]
     EmptyCluster,
 }
@@ -42,8 +44,14 @@ pub async fn name_theme(
     }
     let system = system_prompt();
     let user = build_user_prompt(members);
-    let args: NameThemeArgs =
-        call_structured(llm, api_key, &system, &user, name_theme_tool()).await?;
+    let args: NameThemeArgs = complete_structured_prompt(
+        llm,
+        api_key,
+        &system,
+        &user,
+        name_theme_tool(),
+    )
+    .await?;
     Ok(args)
 }
 
@@ -96,16 +104,12 @@ mod tests {
         let p = build_user_prompt(&members());
         assert!(p.contains("FTC sues data broker"));
         assert!(p.contains("FTC announces new data broker"));
-        // Union of keywords across members.
         assert!(p.contains("data broker"));
         assert!(p.contains("Section 5"));
     }
 
     #[tokio::test]
     async fn empty_cluster_is_a_typed_error() {
-        // We can't reach a real LlmClient in a unit test; building a
-        // dummy one with a localhost base_url is cheap and we never
-        // make a request because the empty-cluster check short-circuits.
         let cfg = wirken_agent::llm::LlmConfig {
             provider: "ollama".into(),
             model: "llama3.1:8b".into(),
