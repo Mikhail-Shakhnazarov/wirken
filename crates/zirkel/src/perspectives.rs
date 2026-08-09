@@ -8,21 +8,19 @@
 //! and discards them at the end of the turn. They are not persisted
 //! outside the audit chain.
 //!
-//! Two HTTP calls plus one LLM call per turn: an opensearch lookup
-//! to discover related Wikipedia titles, then one section-list
-//! fetch per discovered title, then a single structured-output LLM
-//! call that produces the labels. STORM's `persona_generator`
-//! mechanism, with the article-generation back half intentionally
-//! absent.
+//! Two HTTP stages plus one LLM call per turn: an opensearch lookup
+//! to discover related Wikipedia titles, one section-list fetch per
+//! discovered title, then one structured-output LLM call that
+//! produces the labels. STORM's `persona_generator` mechanism, with
+//! the article-generation back half intentionally absent.
 
 use thiserror::Error;
 use wirken_agent::egress::EgressClient;
 use wirken_agent::llm::LlmClient;
+use wirken_agent::structured_output::{StructuredOutputError, complete_structured_prompt};
 
 use crate::fetcher::{FetchError, Fetcher, SourceConfig, WikipediaTocFetcher, fetch_body};
-use crate::synthetic_tool::{
-    EmitPerspectivesArgs, SyntheticToolError, call_structured, emit_perspectives_tool,
-};
+use crate::synthetic_tool::{EmitPerspectivesArgs, emit_perspectives_tool};
 
 /// Production-default Wikipedia Action API endpoint. Tests redirect
 /// to a localhost mock by passing an alternative `api_base` to
@@ -35,8 +33,8 @@ pub enum PerspectiveError {
     Opensearch(String),
     #[error("toc fetch failed: {0}")]
     TocFetch(#[from] FetchError),
-    #[error("perspective-emit LLM call failed: {0}")]
-    Llm(#[from] SyntheticToolError),
+    #[error("perspective-emit structured-output call failed: {0}")]
+    Structured(#[from] StructuredOutputError),
     #[error("no related Wikipedia titles produced for topic")]
     NoRelated,
 }
@@ -79,10 +77,6 @@ pub async fn expand(
                 }
             }
             Err(e) => {
-                // One related title's TOC failing must not abort the
-                // whole expansion. The retriever loop only needs the
-                // labels in aggregate; a thinner heading set just
-                // means slightly less grounding for the LLM.
                 tracing::warn!(
                     "wikipedia toc fetch for related title '{title}' failed: {e}; skipping"
                 );
@@ -91,7 +85,7 @@ pub async fn expand(
     }
 
     let user_prompt = build_user_prompt(topic, &related, &headings);
-    let args: EmitPerspectivesArgs = call_structured(
+    let args: EmitPerspectivesArgs = complete_structured_prompt(
         llm,
         api_key,
         SYSTEM_PROMPT,
@@ -183,22 +177,6 @@ const SYSTEM_PROMPT: &str = "You are Zirkel's perspective expander. Given a topi
 Each label must be 2 to 5 words. No verbs, no full sentences, no quotes. Labels must be distinct: do not return synonyms of the same angle. Prefer concrete framings over abstract ones. \
 You MUST call the zirkel_emit_perspectives tool. Do not respond with text.";
 
-/// Drop labels whose slug collides with an earlier label's slug.
-///
-/// Returned tuple is `(kept, dropped)`. Both vectors preserve the
-/// LLM's emission order; first occurrence of any given slug wins.
-/// The slug helper folds case, whitespace, and Unicode into ASCII
-/// alphanumerics, so two surface-distinct labels can collapse to
-/// the same `SourceConfig.name`. Two synthetic configs with
-/// identical names dispatch the same fetch twice (the seen-table
-/// dedup then drops the second batch as duplicate URLs), but the
-/// audit chain loses the "two perspectives meant the same fetch"
-/// fact and the `RunSummary.perspectives_used` list overstates the
-/// turn's coverage. The system prompt asks the LLM for distinct
-/// labels but does not constrain slug-collision specifically, so
-/// this filter runs unconditionally and the orchestrator records
-/// the dropped labels alongside the kept ones in the
-/// `PerspectiveExpansion` event.
 pub fn dedupe_by_slug(labels: Vec<String>) -> (Vec<String>, Vec<String>) {
     let mut seen: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(labels.len());
@@ -215,11 +193,6 @@ pub fn dedupe_by_slug(labels: Vec<String>) -> (Vec<String>, Vec<String>) {
     (kept, dropped)
 }
 
-/// Slugify a perspective label for use in a synthetic
-/// `SourceConfig.name` field. Lowercase, ASCII alphanumerics kept,
-/// runs of other characters collapsed to a single `-`, leading and
-/// trailing `-` stripped. Empty input returns the literal
-/// `"perspective"` so an audit row never has an empty source name.
 pub fn slug(label: &str) -> String {
     let mut out = String::with_capacity(label.len());
     let mut prev_dash = true;
@@ -305,10 +278,6 @@ mod tests {
 
     #[test]
     fn dedupe_by_slug_treats_empty_label_slugs_as_one() {
-        // Both slug to "perspective" because the helper substitutes
-        // a literal for empty inputs. Pinning so a future slug-helper
-        // change does not silently produce two identical
-        // `SourceConfig.name` values.
         let (kept, dropped) = dedupe_by_slug(vec!["".to_string(), "!!!".to_string()]);
         assert_eq!(kept, vec!["".to_string()]);
         assert_eq!(dropped, vec!["!!!".to_string()]);
@@ -334,7 +303,6 @@ mod tests {
         );
         assert!(u.contains("action=parse"));
         assert!(u.contains("prop=sections"));
-        // Url's encoder uses + for spaces in query strings.
         assert!(u.contains("Biometric") && u.contains("Privacy") && u.contains("Act"));
     }
 
