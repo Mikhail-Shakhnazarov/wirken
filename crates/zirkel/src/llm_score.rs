@@ -1,9 +1,10 @@
 //! LLM relevance scoring for Zirkel candidates.
 //!
-//! One LLM call per candidate using the
-//! [`crate::synthetic_tool::score_candidate_tool`] structured-output
-//! channel. Returns a 0–100 relevance rating plus a one-line
-//! `why_surfaced` rationale and the matched user keyword.
+//! One LLM call per candidate using the reusable
+//! [`wirken_agent::structured_output`] boundary. Zirkel still owns the
+//! result schema in [`crate::synthetic_tool::score_candidate_tool`].
+//! Returns a 0–100 relevance rating plus a one-line `why_surfaced`
+//! rationale and the matched user keyword.
 //!
 //! The keyword pre-filter (Scope C-foundation) already guaranteed
 //! every input here matched at least one user keyword; this pass
@@ -13,20 +14,18 @@
 
 use thiserror::Error;
 use wirken_agent::llm::LlmClient;
+use wirken_agent::structured_output::{StructuredOutputError, complete_structured_prompt};
 
 use crate::fetcher::FetchedItem;
 use crate::interests::Interests;
-use crate::synthetic_tool::{
-    ScoreCandidateArgs, SyntheticToolError, call_structured, score_candidate_tool,
-};
+use crate::synthetic_tool::{ScoreCandidateArgs, score_candidate_tool};
 
-/// Per-call error. `Synthetic` wraps the structured-output failure
-/// modes (LLM didn't call the tool, parse failure, etc.); `Llm`
-/// wraps lower-level transport / provider failures.
+/// Per-call error. Structured-output errors include transport/provider
+/// failure, missing structured response, and typed argument parsing.
 #[derive(Debug, Error)]
 pub enum LlmScoreError {
-    #[error("synthetic-tool call failed: {0}")]
-    Synthetic(#[from] SyntheticToolError),
+    #[error("structured-output call failed: {0}")]
+    Structured(#[from] StructuredOutputError),
 }
 
 /// Score one candidate against the user's interests.
@@ -38,8 +37,14 @@ pub async fn score_candidate(
 ) -> Result<ScoreCandidateArgs, LlmScoreError> {
     let system = system_prompt();
     let user = build_user_prompt(item, interests);
-    let args: ScoreCandidateArgs =
-        call_structured(llm, api_key, &system, &user, score_candidate_tool()).await?;
+    let args: ScoreCandidateArgs = complete_structured_prompt(
+        llm,
+        api_key,
+        &system,
+        &user,
+        score_candidate_tool(),
+    )
+    .await?;
     Ok(args)
 }
 
@@ -123,7 +128,6 @@ mod tests {
     // End-to-end with a mocked LLM is exercised in
     // `crate::orchestrator::tests` — running `score_candidate` here
     // would require either a local OpenAI-compatible HTTP server or
-    // a refactor of LlmClient to accept an injected transport. The
-    // orchestrator integration test gives better coverage for less
-    // duplicated setup.
+    // injecting a transport into LlmClient. The orchestrator
+    // integration test gives better coverage for less duplicated setup.
 }
