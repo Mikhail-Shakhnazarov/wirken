@@ -19,8 +19,20 @@ use thiserror::Error;
 
 use crate::conversation::{Message, Role};
 use crate::error::AgentError;
-use crate::llm::{LlmClient, LlmResponse};
+use crate::llm::{LlmClient, LlmResponse, Usage};
 use crate::tool::ToolDef;
+
+/// Typed structured result plus provider-reported usage.
+///
+/// Usage stays attached to the call boundary even when a caller does
+/// not need it. This avoids forcing evidence- or cost-sensitive
+/// consumers to drop metadata merely because the first Zirkel callers
+/// only needed the value.
+#[derive(Debug)]
+pub struct StructuredOutput<T> {
+    pub value: T,
+    pub usage: Option<Usage>,
+}
 
 /// Failure modes for one structured-output model call.
 #[derive(Debug, Error)]
@@ -55,9 +67,9 @@ pub async fn complete_structured<T: DeserializeOwned>(
     api_key: Option<&str>,
     messages: &[Message],
     output_tool: ToolDef,
-) -> Result<T, StructuredOutputError> {
+) -> Result<StructuredOutput<T>, StructuredOutputError> {
     let tool_name = output_tool.name.clone();
-    let (resp, _usage) = llm
+    let (resp, usage) = llm
         .complete(messages, &[output_tool], api_key)
         .await
         .map_err(StructuredOutputError::Llm)?;
@@ -71,13 +83,14 @@ pub async fn complete_structured<T: DeserializeOwned>(
                     actual,
                 }
             })?;
-            serde_json::from_str::<T>(&call.arguments).map_err(|e| {
+            let value = serde_json::from_str::<T>(&call.arguments).map_err(|e| {
                 StructuredOutputError::ParseArguments {
                     tool: tool_name,
                     error: e.to_string(),
                     raw: call.arguments.clone(),
                 }
-            })
+            })?;
+            Ok(StructuredOutput { value, usage })
         }
         LlmResponse::Text(text) => Err(StructuredOutputError::ExpectedToolCallGotText {
             expected: tool_name,
@@ -99,7 +112,7 @@ pub async fn complete_structured_prompt<T: DeserializeOwned>(
     system_prompt: &str,
     user_prompt: &str,
     output_tool: ToolDef,
-) -> Result<T, StructuredOutputError> {
+) -> Result<StructuredOutput<T>, StructuredOutputError> {
     let messages = vec![
         Message {
             role: Role::System,
