@@ -44,7 +44,7 @@ pub async fn name_theme(
     }
     let system = system_prompt();
     let user = build_user_prompt(members);
-    let args: NameThemeArgs = complete_structured_prompt(
+    let output = complete_structured_prompt::<NameThemeArgs>(
         llm,
         api_key,
         &system,
@@ -52,7 +52,7 @@ pub async fn name_theme(
         name_theme_tool(),
     )
     .await?;
-    Ok(args)
+    Ok(output.value)
 }
 
 fn system_prompt() -> String {
