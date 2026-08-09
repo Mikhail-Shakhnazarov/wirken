@@ -30,6 +30,7 @@ pub mod skill;
 pub mod skill_perms;
 pub mod slash;
 pub mod sse_approval_gate;
+pub mod structured_output;
 pub mod telegram_approval_gate;
 pub mod tool;
 pub mod wasm_sandbox;
