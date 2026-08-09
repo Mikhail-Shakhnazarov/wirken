@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
         "value": output.value,
         "raw_arguments": output.raw_arguments,
         "usage": output.usage,
-        "attempt_receipt": output.receipt,
+        "call_receipt": output.receipt,
     });
     println!("{}", serde_json::to_string_pretty(&record)?);
     Ok(())
