@@ -85,7 +85,7 @@ pub async fn expand(
     }
 
     let user_prompt = build_user_prompt(topic, &related, &headings);
-    let args: EmitPerspectivesArgs = complete_structured_prompt(
+    let output = complete_structured_prompt::<EmitPerspectivesArgs>(
         llm,
         api_key,
         SYSTEM_PROMPT,
@@ -93,8 +93,8 @@ pub async fn expand(
         emit_perspectives_tool(max_perspectives),
     )
     .await?;
-
-    let mut labels: Vec<String> = args
+    let mut labels: Vec<String> = output
+        .value
         .perspectives
         .into_iter()
         .map(|s| s.trim().to_string())
