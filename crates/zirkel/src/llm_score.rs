@@ -37,7 +37,7 @@ pub async fn score_candidate(
 ) -> Result<ScoreCandidateArgs, LlmScoreError> {
     let system = system_prompt();
     let user = build_user_prompt(item, interests);
-    let args: ScoreCandidateArgs = complete_structured_prompt(
+    let output = complete_structured_prompt::<ScoreCandidateArgs>(
         llm,
         api_key,
         &system,
@@ -45,7 +45,7 @@ pub async fn score_candidate(
         score_candidate_tool(),
     )
     .await?;
-    Ok(args)
+    Ok(output.value)
 }
 
 fn system_prompt() -> String {
