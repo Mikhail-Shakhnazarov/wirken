@@ -14,7 +14,8 @@
 //! This module does **not** execute the supplied tool. The tool is an
 //! output schema carrier only.
 
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::conversation::{Message, Role};
@@ -22,7 +23,50 @@ use crate::error::AgentError;
 use crate::llm::{LlmClient, LlmResponse, Usage};
 use crate::tool::ToolDef;
 
-/// Typed structured result plus provider-reported usage.
+/// Provider/runtime evidence for the exact bounded call that produced
+/// a structured result.
+///
+/// This is deliberately separate from any domain-level basis identity.
+/// A caller can bind its own `basis_id`, requirement id, or procedure id
+/// to this receipt without making the provider attempt the identity of
+/// the intellectual object.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StructuredAttemptReceipt {
+    /// Locally minted identity for this physical model attempt.
+    pub attempt_id: String,
+    /// Provider and model from the exact [`crate::llm::LlmConfig`] used.
+    pub provider: String,
+    pub model: String,
+    /// Digest of the complete LLM config. This includes generation
+    /// parameters and endpoint configuration in addition to provider/model.
+    pub config_sha256: String,
+    /// Digest of the normalized message slice handed to [`LlmClient`].
+    /// For this one-shot boundary there is no hidden context-fit step:
+    /// these are the messages passed directly to the provider adapter.
+    pub messages_sha256: String,
+    /// Digest of the exact schema-bearing [`ToolDef`] supplied as the
+    /// structured response channel.
+    pub output_schema_sha256: String,
+    /// Provider-returned tool-call identity when structured admission
+    /// succeeded.
+    pub response_tool_call_id: String,
+    /// Digest of the raw JSON argument bytes returned by the model before
+    /// typed deserialization.
+    pub response_arguments_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct StructuredAttemptStart {
+    attempt_id: String,
+    provider: String,
+    model: String,
+    config_sha256: String,
+    messages_sha256: String,
+    output_schema_sha256: String,
+}
+
+/// Typed structured result plus provider-reported usage and exact call
+/// evidence.
 ///
 /// Usage stays attached to the call boundary even when a caller does
 /// not need it. This avoids forcing evidence- or cost-sensitive
@@ -32,6 +76,7 @@ use crate::tool::ToolDef;
 pub struct StructuredOutput<T> {
     pub value: T,
     pub usage: Option<Usage>,
+    pub receipt: StructuredAttemptReceipt,
 }
 
 /// Failure modes for one structured-output model call.
@@ -39,6 +84,8 @@ pub struct StructuredOutput<T> {
 pub enum StructuredOutputError {
     #[error("LLM call failed: {0}")]
     Llm(#[source] AgentError),
+    #[error("could not serialize structured-output request evidence: {0}")]
+    Evidence(String),
     #[error("expected structured output via '{expected}' but the model responded with text: {text}")]
     ExpectedToolCallGotText { expected: String, text: String },
     #[error("LLM returned an empty response")]
@@ -56,6 +103,41 @@ pub enum StructuredOutputError {
     },
 }
 
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{}", hex(digest.as_ref()))
+}
+
+fn sha256_json<T: Serialize>(value: &T) -> Result<String, StructuredOutputError> {
+    let bytes = serde_json::to_vec(value).map_err(|e| StructuredOutputError::Evidence(e.to_string()))?;
+    Ok(sha256_bytes(&bytes))
+}
+
+fn attempt_start(
+    llm: &LlmClient,
+    messages: &[Message],
+    output_tool: &ToolDef,
+) -> Result<StructuredAttemptStart, StructuredOutputError> {
+    Ok(StructuredAttemptStart {
+        attempt_id: format!("structured-{}", uuid::Uuid::new_v4()),
+        provider: llm.config().provider.clone(),
+        model: llm.config().model.clone(),
+        config_sha256: sha256_json(llm.config())?,
+        messages_sha256: sha256_json(&messages)?,
+        output_schema_sha256: sha256_json(output_tool)?,
+    })
+}
+
 /// Parse one already-received model response through the structured-output contract.
 ///
 /// Keeping response admission separate from provider I/O makes the boundary testable
@@ -65,6 +147,7 @@ fn admit_structured_response<T: DeserializeOwned>(
     response: LlmResponse,
     expected_tool: &str,
     usage: Option<Usage>,
+    start: StructuredAttemptStart,
 ) -> Result<StructuredOutput<T>, StructuredOutputError> {
     match response {
         LlmResponse::ToolCalls(calls) => {
@@ -83,7 +166,21 @@ fn admit_structured_response<T: DeserializeOwned>(
                     raw: call.arguments.clone(),
                 }
             })?;
-            Ok(StructuredOutput { value, usage })
+            let receipt = StructuredAttemptReceipt {
+                attempt_id: start.attempt_id,
+                provider: start.provider,
+                model: start.model,
+                config_sha256: start.config_sha256,
+                messages_sha256: start.messages_sha256,
+                output_schema_sha256: start.output_schema_sha256,
+                response_tool_call_id: call.id.clone(),
+                response_arguments_sha256: sha256_bytes(call.arguments.as_bytes()),
+            };
+            Ok(StructuredOutput {
+                value,
+                usage,
+                receipt,
+            })
         }
         LlmResponse::Text(text) => Err(StructuredOutputError::ExpectedToolCallGotText {
             expected: expected_tool.to_string(),
@@ -106,12 +203,13 @@ pub async fn complete_structured<T: DeserializeOwned>(
     output_tool: ToolDef,
 ) -> Result<StructuredOutput<T>, StructuredOutputError> {
     let tool_name = output_tool.name.clone();
+    let start = attempt_start(llm, messages, &output_tool)?;
     let (response, usage) = llm
         .complete(messages, &[output_tool], api_key)
         .await
         .map_err(StructuredOutputError::Llm)?;
 
-    admit_structured_response(response, &tool_name, usage)
+    admit_structured_response(response, &tool_name, usage, start)
 }
 
 /// Convenience wrapper for the common bounded system+user call shape.
@@ -166,8 +264,19 @@ mod tests {
         }
     }
 
+    fn start() -> StructuredAttemptStart {
+        StructuredAttemptStart {
+            attempt_id: "structured-test".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            config_sha256: "sha256:config".to_string(),
+            messages_sha256: "sha256:messages".to_string(),
+            output_schema_sha256: "sha256:schema".to_string(),
+        }
+    }
+
     #[test]
-    fn admits_expected_tool_call_and_parses_typed_value() {
+    fn admits_expected_tool_call_and_binds_attempt_evidence() {
         let output = admit_structured_response::<FixtureResult>(
             LlmResponse::ToolCalls(vec![tool_call(
                 "emit_fixture",
@@ -175,6 +284,7 @@ mod tests {
             )]),
             "emit_fixture",
             None,
+            start(),
         )
         .unwrap();
 
@@ -186,6 +296,42 @@ mod tests {
             }
         );
         assert!(output.usage.is_none());
+        assert_eq!(output.receipt.attempt_id, "structured-test");
+        assert_eq!(output.receipt.provider, "test-provider");
+        assert_eq!(output.receipt.model, "test-model");
+        assert_eq!(output.receipt.response_tool_call_id, "call-1");
+        assert_eq!(
+            output.receipt.response_arguments_sha256,
+            sha256_bytes(r#"{"answer":"yes","count":2}"#.as_bytes())
+        );
+    }
+
+    #[test]
+    fn attempt_evidence_changes_when_messages_change() {
+        let llm = LlmClient::new(crate::llm::LlmConfig::ollama("fixture-model")).unwrap();
+        let tool = ToolDef {
+            name: "emit_fixture".to_string(),
+            description: "fixture".to_string(),
+            parameters: serde_json::json!({"type":"object"}),
+        };
+        let messages_a = vec![Message {
+            role: Role::User,
+            content: "A".to_string(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        }];
+        let messages_b = vec![Message {
+            role: Role::User,
+            content: "B".to_string(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        }];
+        let a = attempt_start(&llm, &messages_a, &tool).unwrap();
+        let b = attempt_start(&llm, &messages_b, &tool).unwrap();
+        assert_ne!(a.messages_sha256, b.messages_sha256);
+        assert_eq!(a.output_schema_sha256, b.output_schema_sha256);
     }
 
     #[test]
@@ -197,6 +343,7 @@ mod tests {
             )]),
             "emit_fixture",
             None,
+            start(),
         )
         .unwrap_err();
 
@@ -213,6 +360,7 @@ mod tests {
             LlmResponse::Text("plain text".to_string()),
             "emit_fixture",
             None,
+            start(),
         )
         .unwrap_err();
 
@@ -229,6 +377,7 @@ mod tests {
             LlmResponse::Empty,
             "emit_fixture",
             None,
+            start(),
         )
         .unwrap_err();
 
@@ -242,6 +391,7 @@ mod tests {
             LlmResponse::ToolCalls(vec![tool_call("emit_fixture", raw)]),
             "emit_fixture",
             None,
+            start(),
         )
         .unwrap_err();
 
