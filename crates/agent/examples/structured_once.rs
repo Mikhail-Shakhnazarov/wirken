@@ -12,7 +12,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -73,14 +73,17 @@ fn sha256_text(text: &str) -> String {
     format!("sha256:{hex}")
 }
 
-fn verify_materialization(manifest: &StructuredCallManifest) -> Result<()> {
-    let core = serde_json::json!({
+fn materialization_core(manifest: &StructuredCallManifest) -> Value {
+    serde_json::json!({
         "schema_version": manifest.schema_version,
-        "metadata": manifest.metadata,
-        "messages": manifest.messages,
-        "output_tool": manifest.output_tool,
-    });
-    let actual = sha256_text(&canonical_json(&core));
+        "metadata": &manifest.metadata,
+        "messages": &manifest.messages,
+        "output_tool": &manifest.output_tool,
+    })
+}
+
+fn verify_materialization(manifest: &StructuredCallManifest) -> Result<()> {
+    let actual = sha256_text(&canonical_json(&materialization_core(manifest)));
     if actual != manifest.materialization_id {
         bail!(
             "manifest materialization_id mismatch: declared {}, computed {}",
@@ -153,7 +156,7 @@ mod tests {
         let value = serde_json::json!({
             "z": 1,
             "a": {"y": 2, "b": 3},
-            "m": [ {"d": 4, "c": 5} ]
+            "m": [{"d": 4, "c": 5}]
         });
         assert_eq!(
             canonical_json(&value),
@@ -180,13 +183,8 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             },
         };
-        let core = serde_json::json!({
-            "schema_version": manifest.schema_version,
-            "metadata": manifest.metadata,
-            "messages": manifest.messages,
-            "output_tool": manifest.output_tool,
-        });
-        manifest.materialization_id = sha256_text(&canonical_json(&core));
+        manifest.materialization_id =
+            sha256_text(&canonical_json(&materialization_core(&manifest)));
         verify_materialization(&manifest).unwrap();
 
         manifest.messages[0].content = "changed".to_string();
