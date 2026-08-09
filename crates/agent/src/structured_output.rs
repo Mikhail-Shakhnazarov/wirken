@@ -247,7 +247,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            StructuredOutputError::ParseArguments { ref tool, ref raw: seen, .. }
+            StructuredOutputError::ParseArguments { ref tool, raw: ref seen, .. }
                 if tool == "emit_fixture" && seen == raw
         ));
     }
