@@ -31,7 +31,14 @@ The current cross-provider transport is tool calling because that capability alr
 
 ## Result evidence
 
-`StructuredOutput<T>` carries the typed value, provider-reported usage when available, and a `StructuredAttemptReceipt`.
+`StructuredOutput<T>` carries:
+
+- the typed value;
+- the exact raw JSON argument string returned by the model;
+- provider-reported usage when available;
+- a `StructuredAttemptReceipt`.
+
+The raw result remains available because deserializing and later reserializing a typed value can preserve meaning while changing exact bytes. A caller that needs reconstructible model evidence should not be forced to rely on a digest plus a reconstructed serialization.
 
 The receipt binds one physical attempt to:
 
@@ -41,7 +48,7 @@ The receipt binds one physical attempt to:
 - digest of the normalized message slice handed to `LlmClient`;
 - digest of the schema-bearing `ToolDef`;
 - provider-returned tool-call id;
-- digest of the raw JSON argument bytes before typed deserialization.
+- digest of the retained raw JSON argument bytes before typed deserialization.
 
 This is an execution receipt, not a domain object identity. A caller's work/basis/requirement/procedure identifiers remain separate and should be retained alongside it when they matter.
 
@@ -71,6 +78,6 @@ The new module contains pure response-admission tests for:
 - empty response refusal;
 - typed argument mismatch;
 - input-message digest sensitivity;
-- returned raw-argument digest binding.
+- exact raw-result retention and digest binding.
 
 This document records construction, not successful execution. Draft PR #2 exists so the branch can receive ordinary repository format/clippy/test pressure before merge.
